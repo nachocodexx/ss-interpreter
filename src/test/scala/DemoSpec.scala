@@ -1,5 +1,5 @@
 import cats.implicits._
-import mx.cinvestav.domain.{ComposeFile, Consumer, ConsumerEnvs, DataReplicator, DataReplicatorEnvs, Deploy, Environments, Limits, LoadBalancer, LoadBalancerEnvs, Monitoring, MonitoringEnvs, Network, Networks, NodeId, NodeInfo, Port, Ports, Producer, ProducerEnvs, Resources, Service, Services, StorageNode, StorageNodeEnvs, StoragePool, SystemReplicator, SystemReplicatorEnvs, Volume, Volumes, encoderComposeFile, utils}
+import mx.cinvestav.domain.{ComposeFile, Consumer, ConsumerEnvs, DataReplicator, DataReplicatorEnvs, Deploy, Environments, KubernetesDeclarativeFile, Limits, LoadBalancerEnvs, Metadata, Monitoring, MonitoringEnvs, Network, Networks, NodeId, NodeInfo, Port, Ports, Producer, ProducerEnvs, ReplicaManager, Resources, Service, Services, StorageNode, StorageNodeEnvs, StoragePool, SystemReplicator, SystemReplicatorEnvs, Volume, Volumes, encoderComposeFile, utils}
 import io.circe._
 import io.circe.generic.auto._
 import io.circe.syntax._
@@ -7,9 +7,8 @@ import io.circe.yaml.syntax._
 class DemoSpec extends munit .CatsEffectSuite {
 
 
-  test("none-sp1 -> cloud") {
-    //  /test/logs/<idConfig>
-    val idConfig  = "none-sp1"
+  test("sp1") {
+    val idConfig  = "sp1"
     //  Network it's equivalent to set the flag --network in the CLI.
     val myNet     = Network(
       name = "my-net",
@@ -22,8 +21,8 @@ class DemoSpec extends munit .CatsEffectSuite {
     val logVolume        = Volume(hostPath = s"/test/logs/$idConfig", dockerPath = "/app/logs", mode ="rw")
     val dockerVolume     = Volume(hostPath = s"/var/run/docker.sock", dockerPath = "/app/src/docker.sock", mode ="rw")
 //
-    val loadBalancer     = LoadBalancer(
-      nodeId       = NodeId("pool-0"),
+    val replicaManager     = ReplicaManager(
+      nodeId       = NodeId("rm-0"),
       ports        = Port.single(hostPort = 3000,dockerPort = 3000),
       networks     = Networks.single(myNet),
       volumes      = Volumes(logVolume),
@@ -51,14 +50,6 @@ class DemoSpec extends munit .CatsEffectSuite {
       ).some
     )
 //
-    val dataReplicator   = DataReplicator(
-      nodeId       = NodeId("dr-0"),
-      ports        = Port.single(hostPort = 1026,dockerPort = 1026),
-      networks     = Networks.single(myNet),
-      volumes      = Volumes(logVolume),
-      environments = DataReplicatorEnvs()
-    )
-//
     val systemReplicator = SystemReplicator(
       nodeId       = NodeId("sr-0"),
       ports        = Port.single(hostPort = 1025,dockerPort = 1025),
@@ -66,36 +57,42 @@ class DemoSpec extends munit .CatsEffectSuite {
       volumes      =  Volumes(logVolume,dockerVolume),
       environments = SystemReplicatorEnvs(
         daemonDelayMs = 2000,
-        initNodes = 2,
+        initNodes = 1,
         baseCacheSize = 1,
         daemonEnabled = false
       ),
-      depends_on   = List("monitoring-0","dr-0","pool-0")
-    )
-//
-    val monitoring       = Monitoring(
-      nodeId = NodeId("monitoring-0"),
-      ports = Port.single(hostPort = 1027,dockerPort = 1027),
-      networks = Networks.single(myNet),
-      volumes =  Volumes(logVolume),
-      environments = MonitoringEnvs()
+      depends_on   = List("rm-0")
     )
 //
     val sp0            = StoragePool(
-      loadBalancer     = loadBalancer,
-      dataReplicator   = dataReplicator,
+      replicaManager   = replicaManager,
       systemReplicator = systemReplicator,
-      monitoring       = monitoring,
+//      DEPRECATED
+//      storageNodes     = List(
+//        StorageNode(
+//          nodeId        = NodeId("sn-0"),
+//          ports         = Port.single(40002,40002),
+//          networks      = Networks.single(myNet),
+//          volumes       = Volumes(
+//            Volume(hostPath = "/test/logs", dockerPath = "/app/logs", mode = "rw", external = false),
+//            Volume(hostPath = "/test/sink/sn-0", dockerPath = "/app/data", mode = "rw", external = false),
+//          ),
+//          environments = StorageNodeEnvs(),
+//          deploy       = None,
+//          metadata     = Metadata.empty
+//        )
+//      ),
       nextPool         = None
     )
-//
+    // Docker compose file
     val cf               = ComposeFile(
         version = "3",
         services = sp0.toServices,
         volumes = Volumes.empty,
         networks = Networks(myNet)
     )
-//
+   // K8s
+//   val k8s = KubernetesDeclarativeFile(apiVersion = 3, kind = "Deployment")
     utils.toSave(s"./target/output/$idConfig.yml",cf.asJson(encoderComposeFile).asYaml.spaces4.getBytes)
   }
 
@@ -113,7 +110,7 @@ class DemoSpec extends munit .CatsEffectSuite {
     val logVolume         = Volume(hostPath = s"/test/logs/$idConfig", dockerPath = "/app/logs", mode ="rw")
     val dockerVolume      = Volume(hostPath = s"/var/run/docker.sock", dockerPath = "/app/src/docker.sock", mode ="rw")
 //  NODES
-    val loadBalancer      = LoadBalancer(
+    val loadBalancer      = ReplicaManager(
       nodeId       = NodeId("pool-0"),
       ports        = Port.single(hostPort = 3000,dockerPort = 3000),
       networks     = Networks.single(myNet),
@@ -194,18 +191,14 @@ class DemoSpec extends munit .CatsEffectSuite {
     val monitoring1       = monitoring.copy(nodeId = NodeId("monitoring-1"),ports = Port.single(hostPort = 2027,dockerPort = 2027))
 //
     val sp1               = StoragePool(
-      loadBalancer = loadBalancer1,
-      dataReplicator = dataReplicator1,
+      replicaManager = loadBalancer1,
       systemReplicator =systemReplicator1,
-      monitoring = monitoring1,
       nextPool = None
     )
 
     val sp0               = StoragePool(
-      loadBalancer     = loadBalancer,
-      dataReplicator   = dataReplicator,
+      replicaManager     = loadBalancer,
       systemReplicator = systemReplicator,
-      monitoring       = monitoring,
       nextPool         = Some(sp1)
     )
 //  _______________________________________________
@@ -234,7 +227,7 @@ class DemoSpec extends munit .CatsEffectSuite {
     val logVolume         = Volume(hostPath = s"/test/logs/$idConfig", dockerPath = "/app/logs", mode ="rw")
     val dockerVolume      = Volume(hostPath = s"/var/run/docker.sock", dockerPath = "/app/src/docker.sock", mode ="rw")
 //
-    val loadBalancer      = LoadBalancer(
+    val loadBalancer      = ReplicaManager(
       nodeId       = NodeId("pool-0"),
       ports        = Port.single(hostPort = 3000,dockerPort = 3000),
       networks     = Networks.single(myNet),
@@ -298,10 +291,8 @@ class DemoSpec extends munit .CatsEffectSuite {
     )
     //
     val sp0               = StoragePool(
-      loadBalancer     = loadBalancer,
-      dataReplicator   = dataReplicator,
+      replicaManager     = loadBalancer,
       systemReplicator = systemReplicator,
-      monitoring       = monitoring,
     )
     val cf                = ComposeFile(
       version = "3",

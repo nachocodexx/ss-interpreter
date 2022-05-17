@@ -1,6 +1,6 @@
 package mx.cinvestav
+import cats.data.NonEmptyList
 import cats.effect.{IO, Resource}
-import com.sun.xml.internal.ws.wsdl.writer.document.Service
 import cats.implicits._
 import io.circe._
 import io.circe.generic.auto._
@@ -10,12 +10,74 @@ import mx.cinvestav.domain.LoadBalancerAlgorithm.LoadBalancerAlgorithm
 import java.io.{BufferedOutputStream, FileOutputStream}
 import javax.swing.tree.AbstractLayoutCache.NodeDimensions
 import scala.util.Random
-//import io.circe.
 
 package object domain {
-//  object docker {
-//
-//  }
+object replica {
+  object what {
+    sealed trait What
+    case class File(
+                     filename:String,
+                     size:Long,
+                     digest:Option[Array[Byte]]
+                   ) extends What
+    case class Files(fs:NonEmptyList[File]) extends What
+    case class Block(id:String,index:Int,guid:String,size:Long,digest:Option[Array[Byte]]) extends What
+    case class Blocks(bs:NonEmptyList[Block]) extends What
+  }
+  //
+
+  //
+  object where {
+    sealed trait Where
+    case class StorageNode(id:String) extends Where
+    case class StorageNodeSubset(
+                                  ids:Set[String],
+                                  order:Option[List[Int]]
+                                ) extends Where
+  }
+  //
+  object who {
+    import mx.cinvestav.domain.replica.where.Where
+    sealed trait Who
+    case class Node(id:String) extends Who with Where
+  }
+  //
+  object how {
+    sealed trait How
+    object ReplicationTechnique extends Enumeration {
+      type ReplicationTechnique = Value
+      val Active,Passive = Value
+    }
+    object ReplicationTransferType extends Enumeration {
+      type ReplicationTransferType = Value
+      val Push, Pull = Value
+    }
+    case class Context(replicationTechnique:ReplicationTechnique.ReplicationTechnique,
+                       replicationTransferType:ReplicationTransferType.ReplicationTransferType
+                      ) extends How
+  }
+  object when {
+    sealed trait When
+    case object Reactive extends When
+    case class ProActive(kind:String) extends When
+  }
+
+  import mx.cinvestav.domain.replica.who.Who
+  import mx.cinvestav.domain.replica.what.What
+  import mx.cinvestav.domain.replica.how.How
+  import mx.cinvestav.domain.replica.where.Where
+  import mx.cinvestav.domain.replica.when.When
+
+
+  case class Replica(
+                      who:Who,
+                      what:What,
+                      where:Where,
+                      how:How,
+                      when:When
+                    )
+  }
+
   object utils {
   def toSave(outputPath:String,data:Array[Byte]): IO[Unit] = {
     val buff = new BufferedOutputStream(new FileOutputStream(outputPath)).pure[IO]
@@ -138,6 +200,9 @@ package object domain {
   case class Metadata(data:Map[String,String]){
     def get[B](key:String,castTo:String=>B):Option[B] = data.get(key).map(castTo)
   }
+  object Metadata {
+    def empty = Metadata(data = Map.empty[String,String])
+  }
   type StorageNodes = List[StorageNode]
   case class Image(name:String,tag:String){
     override def toString: String = s"$name:$tag"
@@ -213,7 +278,8 @@ package object domain {
                bufferSize:Int = 65536,
                responseHeaderTimeoutMs:Long =  10000,
                apiVersion:Int = 2,
-               logPath:String = "/app/logs"
+               logPath:String = "/app/logs",
+               manualStorageNodes:List[String] = List.empty[String]
 
              ) =
       Environments(
@@ -247,7 +313,8 @@ package object domain {
       "MAX_CONNECTIONS" -> maxConnections.toString,
       "BUFFER_SIZE" -> bufferSize.toString,
       "RESPONSE_HEADER_TIMEOUT_MS"-> responseHeaderTimeoutMs.toString,
-      "LOG_PATH" -> logPath
+      "LOG_PATH" -> logPath,
+      "MANUAL_STORAGE_NODES" -> manualStorageNodes.mkString(",")
     )
   }
   object LoadBalancerEnvs{
@@ -336,6 +403,7 @@ package object domain {
     def single(n:Network): Networks = Networks(n)
   }
   case class ComposeFile(version:String, services:Services, volumes:Volumes, networks:Networks)
+  case class KubernetesDeclarativeFile(apiVersion:Int,kind:String)
 //
   case class Placement(constraints:List[String],max_replicas_per_node:Int=1)
   object Placement {
@@ -427,9 +495,9 @@ package object domain {
     override def name: String = nodeId.value
     override def toJSON[A <: Service](implicit encoder: Encoder[A]): Json = this.asInstanceOf[A].asJson(encoder = encoder)
   }
-  case class LoadBalancer(
+  case class ReplicaManager(
                                nodeId:NodeId,
-                               image:Image = Image("nachocode/storage-pool","v2") ,
+                               image:Image = Image("nachocode/load-balancer","v2") ,
                                ports:Ports ,
                                networks: Networks,
                                volumes:Volumes = Volumes.empty,
@@ -502,6 +570,7 @@ package object domain {
              bufferSize:Int = 65536,
              responseHeaderTimeoutMs:Long= 390000,
              apiVersion:Int=2,
+             delayReplicasMs:Long = 0L
              ): Environments = Environments(
       "POOL_ID" -> poolId.value,
       "CLOUD_ENABLED" -> cloudEnabled.toString ,
@@ -520,7 +589,8 @@ package object domain {
       "INTERVAL_MS" -> intervalMs.toString,
       "MAX_CONNECTIONS" -> maxConnections.toString,
       "BUFFER_SIZE" -> bufferSize.toString,
-      "RESPONSE_HEADER_TIMEOUT_MS" -> responseHeaderTimeoutMs.toString
+      "RESPONSE_HEADER_TIMEOUT_MS" -> responseHeaderTimeoutMs.toString,
+      "DELAY_REPLICA_MS" -> delayReplicasMs.toString
     )
   }
   //
@@ -549,27 +619,27 @@ package object domain {
 
 
   case class StoragePool(
-                          loadBalancer: LoadBalancer,
-                          dataReplicator: DataReplicator,
+                          replicaManager: ReplicaManager,
+                          //                          dataReplicator: DataReplicator,
                           systemReplicator: SystemReplicator,
-                          monitoring: Monitoring,
-                          storagesNodes:List[StorageNode] = List.empty[StorageNode],
+                          //                          monitoring: Monitoring,
+                          storageNodes:List[StorageNode] = List.empty[StorageNode],
                           nextPool:Option[StoragePool]=None,
                         ){
     def toServices: Services = {
       val getFirstPort = (s:Service,defaultPort:Int) => s.ports.values.headOption.map(_.containerPort).getOrElse(defaultPort)
       nextPool match {
         case Some(_nextPool) =>
-          val lbPort = getFirstPort(loadBalancer,3000).toString
-          val lbHostname = loadBalancer.nodeId.value
+          val lbPort = getFirstPort(replicaManager,3000).toString
+          val lbHostname = replicaManager.nodeId.value
           val defaultNodeInfos = Map(
               "POOL_HOSTNAME"       -> lbHostname,
               "POOL_PORT"           -> lbPort,
-              "CACHE_POOL_HOSTNAME" -> _nextPool.loadBalancer.nodeId.value,
-              "CACHE_POOL_PORT"     -> getFirstPort(_nextPool.loadBalancer,3001).toString
+              "CACHE_POOL_HOSTNAME" -> _nextPool.replicaManager.nodeId.value,
+              "CACHE_POOL_PORT"     -> getFirstPort(_nextPool.replicaManager,3001).toString
 //                _nextPool.loadBalancer.ports.values.headOption.map(_.containerPort).getOrElse(3001).toString
             )
-          val sns = storagesNodes
+          val sns = storageNodes
             .map { sn =>
               val mp = defaultNodeInfos ++ sn.environments.values
               sn.copy(environments = Environments(mp.toSeq:_*))
@@ -578,70 +648,72 @@ package object domain {
           val nodeInfosEnvs = Map(
               "POOL_HOSTNAME"->lbHostname,
               "POOL_PORT"->lbPort,
-              "MONITORING_HOSTNAME" -> monitoring.nodeId.value,
-              "MONITORING_PORT" -> getFirstPort(monitoring,10200).toString,
               "CLOUD_ENABLED" -> "false",
-              "DATA_REPLICATOR_HOSTNAME" -> dataReplicator.nodeId.value,
-              "DATA_REPLICATOR_PORT" -> getFirstPort(dataReplicator,1026).toString
           )
           val ss = List(
-            loadBalancer
+            replicaManager
               .copy(
                 environments = Environments(
-                  (loadBalancer.environments.values ++ Map("HAS_NEXT_POOL"->"true","CLOUD_ENABLED"->"false")).toSeq:_*
+                  (replicaManager.environments.values ++ Map("HAS_NEXT_POOL"->"true","CLOUD_ENABLED"->"false")).toSeq:_*
                 )
               )
               .asInstanceOf[Service],
-            dataReplicator.asInstanceOf[Service],
+//            dataReplicator.asInstanceOf[Service],
             systemReplicator.copy(
               environments =
                 Environments(
                   (systemReplicator.environments.values ++ nodeInfosEnvs):_*
                 )
             ).asInstanceOf[Service],
-            monitoring.asInstanceOf[Service],
+//            monitoring.asInstanceOf[Service],
           )  ++ sns
           val value = _nextPool.toServices
           Services(ss:_*)+value
         case None =>
           val defaultNodeInfos = Map(
-              "POOL_HOSTNAME"->loadBalancer.nodeId.value,
-              "POOL_PORT"-> loadBalancer.ports.values.headOption.map(_.containerPort).getOrElse(3000).toString,
-            )
-          val sns = storagesNodes
+              "POOL_HOSTNAME"->replicaManager.nodeId.value,
+              "POOL_PORT"-> replicaManager.ports.values.headOption.map(_.containerPort).getOrElse(3000).toString,
+              "SERVICE_REPLICATOR_HOSTNAME" -> systemReplicator.nodeId.value,
+              "SERVICE_REPLICATOR_PORT" -> systemReplicator.ports.values.head.containerPort.toString,
+              "STORAGE_PATH" -> "/app/data",
+              "LOG_PATH" -> "/app/logs",
+          )
+          val sns = storageNodes
             .map { sn =>
+              val generatedEnvs = Map(
+                "NODE_ID" -> sn.nodeId.value,
+                "NODE_PORT" -> sn.ports.values.head.containerPort.toString,
+                "TOTAL_STORAGE_CAPACITY" -> "",
+                "TOTAL_MEMORY_CAPACITY" -> "",
+              )
               val mp = defaultNodeInfos ++ sn.environments.values
               sn.copy(environments = Environments(mp.toSeq:_*))
             }
             .map(_.asInstanceOf[Service])
-          val lbPort = loadBalancer.ports.values.headOption.map(_.containerPort).getOrElse(3000).toString
-          val lbHostname = loadBalancer.nodeId.value
+          val lbPort = replicaManager.ports.values.headOption.map(_.containerPort).getOrElse(3000).toString
+          val lbHostname = replicaManager.nodeId.value
 
           val nodeInfosEnvs = Map(
             "POOL_HOSTNAME"->lbHostname,
             "POOL_PORT"->lbPort,
-            "MONITORING_HOSTNAME" -> monitoring.nodeId.value,
-            "MONITORING_PORT" -> getFirstPort(monitoring,10200).toString,
             "CLOUD_ENABLED" -> "true",
-            "DATA_REPLICATOR_HOSTNAME" -> dataReplicator.nodeId.value,
-            "DATA_REPLICATOR_PORT" -> getFirstPort(dataReplicator,2026).toString
           )
           val ss = List(
-            loadBalancer
+            replicaManager
               .copy(
                 environments = Environments(
-                  (loadBalancer.environments.values ++ Map("HAS_NEXT_POOL"->"false","CLOUD_ENABLED"->"true")):_*
+                  (replicaManager.environments.values ++ Map("HAS_NEXT_POOL"->"false","CLOUD_ENABLED"->"true")):_*
                 )
               )
               .asInstanceOf[Service],
-            dataReplicator.asInstanceOf[Service],
+//            dataReplicator.asInstanceOf[Service],
             systemReplicator.copy(
               environments =
                 Environments(
                   (systemReplicator.environments.values ++ nodeInfosEnvs):_*
                 )
             ).asInstanceOf[Service],
-            monitoring.asInstanceOf[Service],
+//            monitoring.asInstanceOf[Service],
           )  ++ sns
           Services(ss:_*)
       }

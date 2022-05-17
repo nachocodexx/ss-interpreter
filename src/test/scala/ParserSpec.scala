@@ -1,4 +1,4 @@
-import mx.cinvestav.domain.{ComposeFile, Consumer, DataContainer,  Deploy, Environments, Image, Limits, LoadBalancer, Metadata, Network, Networks, Node, NodeId,Placement, PoolId, Port, Ports,  Resources, Service, Services,  Volume, Volumes,encoderComposeFile, encoderNetwork, encoderNetworks, encoderService, encoderStorageNode, encoderVolumes}
+import mx.cinvestav.domain.{ComposeFile, Consumer, DataContainer,  Deploy, Environments, Image, Limits, ReplicaManager, Metadata, Network, Networks, Node, NodeId,Placement, PoolId, Port, Ports,  Resources, Service, Services,  Volume, Volumes,encoderComposeFile, encoderNetwork, encoderNetworks, encoderService, encoderStorageNode, encoderVolumes}
 import cats.implicits._
 import io.circe._
 import io.circe.generic.auto._
